@@ -10,6 +10,7 @@ import numpy as np
 from utils.utils import AverageMeter, dataframe_from_folder
 from sklearn.model_selection import train_test_split
 import os
+import deepspeed
 
 
 def main():
@@ -53,7 +54,11 @@ def main():
         model.conv1 = new_conv
     device = 'cuda'
     model.to(device)
-    model = nn.DataParallel(model)
+
+    #model = nn.DataParallel(model)
+    parameters = filter(lambda p: p.requires_grad, model.parameters())
+    model_engine, optimizer, train_dataloader, __ = deepspeed.initialize(args=args, model=model, model_parameters=parameters, training_data=train_dataset, collate_fn=collate.create_2d_batch_from_3d_input)
+
     torch.backends.cudnn.benchmark = args.cuddn_auto_tuner
 
     class_counts = np.array(args.n_outputs * [1])
@@ -67,7 +72,7 @@ def main():
 
     criterion = nn.CrossEntropyLoss(weight=weights)
 
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=2e-5)
+    #optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=2e-5)
 
     #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, 0.1, steps_per_epoch=len(dataloader), epochs=args.epochs)
 
@@ -76,16 +81,19 @@ def main():
         train_loss = AverageMeter()
         train_acc = AverageMeter()
         train_f1 = AverageMeter()
-        for j, (inputs, labels) in enumerate(train_dataloader):
+        for j, data in enumerate(train_dataloader):
             batch_start = time.time()
-            inputs = inputs.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            outputs = model(inputs)
+            #inputs = inputs.to(device, non_blocking=True)
+            #labels = labels.to(device, non_blocking=True)
+            inputs, labels = data[0].to(model_engine.local_rank), data[1].to(model_engine.local_rank)
+            outputs = model_engine(inputs)
             loss = criterion(outputs, labels)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            #optimizer.zero_grad()
+            #loss.backward()
+            #optimizer.step()
+            model_engine.backward(loss)
+            model_engine.step()
 
             metric_labels = labels.cpu().detach().numpy()
             _, preds = torch.max(outputs.data.cpu(), 1)
