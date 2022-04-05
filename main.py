@@ -4,10 +4,10 @@ from sklearn.metrics import accuracy_score, f1_score
 import torch.nn as nn
 import torchvision.models as models
 from torchvision.models.inception import BasicConv2d, InceptionAux
-from arguments import get_args
+from arguments import get_train_args
 from data import pandas_dataset, collate
 import numpy as np
-from utils.utils import AverageMeter, dataframe_from_folder
+from utils.utils import AverageMeter, dataframe_from_class_folder, finetuning_class_conversion
 from sklearn.model_selection import train_test_split
 import os
 import deepspeed
@@ -15,51 +15,29 @@ import deepspeed
 
 def main():
 
-    args = get_args()
-    dataframe = dataframe_from_folder(args.source_dataset_folder)
+    args = get_train_args()
+    dataframe = dataframe_from_class_folder(args.source_dataset_folder)
+    if args.finetune:
+        dataframe, class_conv_dict = finetuning_class_conversion(dataframe, args.allowed_classes, [[0, 1], [2, 3], [4, 6]])
+        print(class_conv_dict)
     df_train, df_val = train_test_split(dataframe, test_size=0.15, stratify=dataframe['label'])
     train_dataset = pandas_dataset.PandasDataset(df_train, target_length=1, target_height=484, target_width=636)
     val_dataset = pandas_dataset.PandasDataset(df_val, target_length=1, target_height=484, target_width=636)
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=8, num_workers=args.n_workers, shuffle=True,
-                                             pin_memory=args.pin_memory, drop_last=args.drop_last,
+                                             pin_memory=args.no_pin_memory, drop_last=args.keep_last,
                                              collate_fn=collate.create_2d_batch_from_3d_input)
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=8, num_workers=args.n_workers,
-                                                   shuffle=True,
-                                                   pin_memory=args.pin_memory, drop_last=args.drop_last,
+                                                   pin_memory=args.no_pin_memory, drop_last=args.keep_last,
                                                    collate_fn=collate.create_2d_batch_from_3d_input)
-    if args.model_name == 'inception':
-        model = models.inception_v3(pretrained=True, transform_input=False)
-        model.fc = nn.Linear(2048, args.n_outputs)
-        model.AuxLogits = InceptionAux(768, args.n_outputs)
-        new_conv = BasicConv2d(1, 32, kernel_size=3, stride=2)
-        first_layer_sd = model.Conv2d_1a_3x3.state_dict()
-        first_layer_sd['conv.weight'] = first_layer_sd['conv.weight'].mean(dim=1, keepdim=True)
-        new_conv.load_state_dict(first_layer_sd)
-        model.Conv2d_1a_3x3 = new_conv
-    elif args.model_name == 'resnet':
-        model = models.resnet50(pretrained=True)
-        model.fc = nn.Linear(in_features=2048, out_features=args.n_outputs, bias=True)
-        new_conv = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-        first_layer_sd = model.conv1.state_dict()
-        first_layer_sd['weight'] = first_layer_sd['weight'].mean(dim=1, keepdim=True)
-        new_conv.load_state_dict(first_layer_sd)
-        model.conv1 = new_conv
-    elif args.model_name == 'resnext':
-        model = models.resnext50_32x4d(pretrained=True)
-        model.fc = nn.Linear(in_features=2048, out_features=args.n_outputs, bias=True)
-        new_conv = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-        first_layer_sd = model.conv1.state_dict()
-        first_layer_sd['weight'] = first_layer_sd['weight'].mean(dim=1, keepdim=True)
-        new_conv.load_state_dict(first_layer_sd)
-        model.conv1 = new_conv
-    device = 'cuda'
+    model = get_model(args)
+    device = torch.cuda.current_device()
     model.to(device)
+    #model.half()
+    model = nn.DataParallel(model)
+    #parameters = filter(lambda p: p.requires_grad, model.parameters())
+    #model_engine, optimizer, train_dataloader, __ = deepspeed.initialize(args=args, model=model, model_parameters=parameters, training_data=train_dataset, collate_fn=collate.create_2d_batch_from_3d_input)
 
-    #model = nn.DataParallel(model)
-    parameters = filter(lambda p: p.requires_grad, model.parameters())
-    model_engine, optimizer, train_dataloader, __ = deepspeed.initialize(args=args, model=model, model_parameters=parameters, training_data=train_dataset, collate_fn=collate.create_2d_batch_from_3d_input)
-
-    torch.backends.cudnn.benchmark = args.cuddn_auto_tuner
+    torch.backends.cudnn.benchmark = args.no_cuddn_auto_tuner
 
     class_counts = np.array(args.n_outputs * [1])
     for i in dataframe['label'].value_counts().index:
@@ -72,28 +50,32 @@ def main():
 
     criterion = nn.CrossEntropyLoss(weight=weights)
 
-    #optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=2e-5)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=2e-5)
 
     #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, 0.1, steps_per_epoch=len(dataloader), epochs=args.epochs)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.1, patience=2, verbose=True)
+
+    best_f1_score = 0
+    checkpoint_name = os.path.join(args.checkpoint_save_path, 'inception_2c_3c_4c_lax_merged_100_epochs.pth')
 
     for i in range(args.epochs):
         model.train()
         train_loss = AverageMeter()
         train_acc = AverageMeter()
         train_f1 = AverageMeter()
-        for j, data in enumerate(train_dataloader):
+        for j, (inputs, labels) in enumerate(train_dataloader):
             batch_start = time.time()
-            #inputs = inputs.to(device, non_blocking=True)
-            #labels = labels.to(device, non_blocking=True)
-            inputs, labels = data[0].to(model_engine.local_rank), data[1].to(model_engine.local_rank)
-            outputs = model_engine(inputs)
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            #inputs, labels = data[0].to(model_engine.local_rank), data[1].to(model_engine.local_rank)
+            outputs = model(inputs)
             loss = criterion(outputs, labels)
 
-            #optimizer.zero_grad()
-            #loss.backward()
-            #optimizer.step()
-            model_engine.backward(loss)
-            model_engine.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            #model_engine.backward(loss)
+            #model_engine.step()
 
             metric_labels = labels.cpu().detach().numpy()
             _, preds = torch.max(outputs.data.cpu(), 1)
@@ -104,13 +86,13 @@ def main():
             train_acc.update(acc)
             train_f1.update(t_f1)
             batch_time = time.time() - batch_start
-            if j % 100 == 0:
+            if j % 10000 == 1:
                 print('Training Batch: [{}/{}] in epoch: {} \t '
                       'Training Loss: {loss.val:.4f} ({loss.avg:.4f}) \t '
                       'Training Accuracy Score: {metric.val:.3f} ({metric.avg:.3f}) \t'
                       'Training F1 Score: {f1.val:.3f} ({f1.avg:.3f}) \t'
                       'Batch Time: {bt:.5f} seconds \t'
-                      .format(j+1, len(train_dataloader), i + 1, loss=train_loss, metric=train_acc, f1=train_f1, bt=batch_time))
+                      .format(j+1, len(train_dataloader.dataset), i + 1, loss=train_loss, metric=train_acc, f1=train_f1, bt=batch_time))
             #scheduler.step()
 
         # End of training epoch prints and updates
@@ -144,11 +126,12 @@ def main():
             print('Finished Validation Epoch: {} \t '
                   'Validation Loss: {loss.avg:.4f} \t '
                   'Validation Accuracy score: {metric.avg:.3f} \t'
-                  'Validation F1 Score: {f1.val:.3f} ({f1.avg:.3f}) \t'
+                  'Validation F1 Score: {f1.avg:.3f} \t'
                   .format(i + 1, loss=val_loss, metric=val_acc, f1=val_f1))
-
-    checkpoint_name = os.path.join(args.checkpoint_save_path, 'all_classes_100_epochs.pth')
-    save_checkpoint(checkpoint_name, model, optimizer)
+            scheduler.step(val_loss.avg)
+            if val_f1.avg > best_f1_score:
+                best_f1_score = val_f1.avg
+                save_checkpoint(checkpoint_name, model, optimizer)
 
 
 def save_checkpoint(save_file_path, model, optimizer):
@@ -161,6 +144,36 @@ def save_checkpoint(save_file_path, model, optimizer):
         'optimizer': optimizer.state_dict(),
     }
     torch.save(save_states, save_file_path)
+
+
+def get_model(args):
+    if args.model_name == 'inception':
+        model = models.inception_v3(pretrained=True, transform_input=False)
+        model.fc = nn.Linear(2048, args.n_outputs)
+        model.AuxLogits = InceptionAux(768, args.n_outputs)
+        model.aux_logits = False
+        new_conv = BasicConv2d(1, 32, kernel_size=3, stride=2)
+        first_layer_sd = model.Conv2d_1a_3x3.state_dict()
+        first_layer_sd['conv.weight'] = first_layer_sd['conv.weight'].mean(dim=1, keepdim=True)
+        new_conv.load_state_dict(first_layer_sd)
+        model.Conv2d_1a_3x3 = new_conv
+    elif args.model_name == 'resnet':
+        model = models.resnet50(pretrained=True)
+        model.fc = nn.Linear(in_features=2048, out_features=args.n_outputs, bias=True)
+        new_conv = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        first_layer_sd = model.conv1.state_dict()
+        first_layer_sd['weight'] = first_layer_sd['weight'].mean(dim=1, keepdim=True)
+        new_conv.load_state_dict(first_layer_sd)
+        model.conv1 = new_conv
+    elif args.model_name == 'resnext':
+        model = models.resnext50_32x4d(pretrained=True)
+        model.fc = nn.Linear(in_features=2048, out_features=args.n_outputs, bias=True)
+        new_conv = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        first_layer_sd = model.conv1.state_dict()
+        first_layer_sd['weight'] = first_layer_sd['weight'].mean(dim=1, keepdim=True)
+        new_conv.load_state_dict(first_layer_sd)
+        model.conv1 = new_conv
+    return model
 
 
 if __name__ == '__main__':
